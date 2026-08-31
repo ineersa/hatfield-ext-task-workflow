@@ -8,6 +8,8 @@ use Ineersa\Hatfield\ExtensionApi\Exec\ExecInterface;
 use Ineersa\Hatfield\ExtensionApi\Exec\ExecOptionsDTO;
 use Ineersa\Hatfield\ExtensionApi\Exec\ExecResultDTO;
 use Ineersa\HatfieldExt\TaskWorkflow\Exec\GitExecutor;
+use Ineersa\HatfieldExt\TaskWorkflow\Ide\JetBrainsMcpClient;
+use Ineersa\HatfieldExt\TaskWorkflow\Ide\WorktreeIdeaSetup;
 use Ineersa\HatfieldExt\TaskWorkflow\Store\TaskInfo;
 use Ineersa\HatfieldExt\TaskWorkflow\Tool\InvocationControl;
 
@@ -128,6 +130,11 @@ final class WorktreeManager
         }
 
         $vendorCopied = $this->copyTreeIfMissing($codeRoot.'/vendor', $worktree.'/vendor', $control);
+        if ($vendorCopied instanceof ExecResultDTO) {
+            $this->cleanupPartialWorktree($codeRoot, $worktree, $slug, $base);
+
+            return $vendorCopied;
+        }
         if (null !== ($interrupt = $control?->interrupted('Interrupted while copying vendor.'))) {
             $this->cleanupPartialWorktree($codeRoot, $worktree, $slug, $base);
 
@@ -135,10 +142,33 @@ final class WorktreeManager
         }
 
         $veraCopied = $this->copyTreeIfMissing($codeRoot.'/.vera', $worktree.'/.vera', $control);
+        if ($veraCopied instanceof ExecResultDTO) {
+            $this->cleanupPartialWorktree($codeRoot, $worktree, $slug, $base);
+
+            return $veraCopied;
+        }
         if (null !== ($interrupt = $control?->interrupted('Interrupted while copying .vera.'))) {
             $this->cleanupPartialWorktree($codeRoot, $worktree, $slug, $base);
 
             return $this->interruptResult($interrupt);
+        }
+
+        if ($this->sourceHasExtensionApiPackage($codeRoot) && !$this->hasUsableExtensionApiLink($worktree)) {
+            try {
+                $repair = $this->repairRootVendor($worktree, $control);
+            } catch (\Throwable $e) {
+                $this->cleanupPartialWorktree($codeRoot, $worktree, $slug, $base);
+                throw new \RuntimeException('vendor package link broken: Composer repair failed.', 0, $e);
+            }
+            if ($repair instanceof ExecResultDTO) {
+                $this->cleanupPartialWorktree($codeRoot, $worktree, $slug, $base);
+
+                return $repair;
+            }
+            if (!$this->hasUsableExtensionApiLink($worktree)) {
+                $this->cleanupPartialWorktree($codeRoot, $worktree, $slug, $base);
+                throw new \RuntimeException('vendor package link broken: vendor/ineersa/hatfield-extension-api is unavailable after Composer repair.');
+            }
         }
 
         $exclusion = $this->addWorktreeExclusions($slug, $base);
@@ -155,6 +185,9 @@ final class WorktreeManager
             return $extensionsVendorInstalled;
         }
 
+        $ideaSetup = WorktreeIdeaSetup::ensure($codeRoot, $worktree);
+        $ideOpenNote = JetBrainsMcpClient::openWorktreeProject($codeRoot, $worktree);
+
         return new WorktreeCreateResult(
             branch: $branch,
             worktree: $worktree,
@@ -164,6 +197,8 @@ final class WorktreeManager
             extensionsVendorInstalled: $extensionsVendorInstalled,
             ideaExclusionsUpdated: $exclusion['updated'],
             ideaNote: $exclusion['note'] ?? null,
+            ideaSetupNote: $ideaSetup['note'] ?? null,
+            ideOpenNote: $ideOpenNote,
         );
     }
 
@@ -217,11 +252,27 @@ final class WorktreeManager
             throw new \RuntimeException("Worktree has uncommitted changes; commit them before moving to DONE.\n{$worktree}\n{$wtStatus->stdout}");
         }
 
+        // Close IDE project only after dirty-worktree preflight and only when cleanup will remove it.
+        $closedForCleanup = false;
+        if ($options['cleanupWorktree'] && is_dir($worktree)) {
+            $notes[] = JetBrainsMcpClient::closeWorktreeProject($codeRoot, $worktree);
+            $closedForCleanup = true;
+        }
+
         $merge = $this->git->git(['merge', '--no-ff', '--no-edit', $branch], $codeRoot, 120.0, $control);
         if ($merge->cancelled || $merge->timedOut) {
+            if ($closedForCleanup && is_dir($worktree)) {
+                $notes[] = JetBrainsMcpClient::openWorktreeProject($codeRoot, $worktree);
+                $notes[] = 'Reopened JetBrains project after interrupted merge for '.$worktree.'.';
+            }
+
             return $merge;
         }
         if (0 !== $merge->exitCode) {
+            if ($closedForCleanup && is_dir($worktree)) {
+                $notes[] = JetBrainsMcpClient::openWorktreeProject($codeRoot, $worktree);
+                $notes[] = 'Reopened JetBrains project after failed merge for '.$worktree.'.';
+            }
             $conflicts = $this->git->git(['diff', '--name-only', '--diff-filter=U'], $codeRoot, 120.0, $control);
             if ($conflicts->cancelled || $conflicts->timedOut) {
                 return $conflicts;
@@ -237,9 +288,18 @@ final class WorktreeManager
             // after a successful remove so a dirty/failed worktree keeps its markers.
             $cleanup = $this->cleanupWorktreeAndIdeaExclusions($codeRoot, $task, failClosed: false, control: $control);
             if ($cleanup instanceof ExecResultDTO) {
+                if ($closedForCleanup && is_dir($worktree)) {
+                    $notes[] = JetBrainsMcpClient::openWorktreeProject($codeRoot, $worktree);
+                    $notes[] = 'Reopened JetBrains project after interrupted worktree cleanup for '.$worktree.'.';
+                }
+
                 return $cleanup;
             }
             array_push($notes, ...$cleanup);
+            if ($closedForCleanup && is_dir($worktree)) {
+                $notes[] = JetBrainsMcpClient::openWorktreeProject($codeRoot, $worktree);
+                $notes[] = 'Reopened JetBrains project after failed worktree cleanup for '.$worktree.'.';
+            }
         }
 
         if ($options['deleteBranch']) {
@@ -299,7 +359,36 @@ final class WorktreeManager
             return $notes;
         }
 
-        return $this->cleanupWorktreeAndIdeaExclusions($codeRoot, $task, failClosed: true, control: $control);
+        // Fail-closed: dirty worktree must throw before close so an active dirty
+        // cancellation does not leave the IDE project closed.
+        $wtStatus = $this->git->gitOk(['status', '--porcelain'], $worktree, 120.0, $control);
+        if ($wtStatus->cancelled || $wtStatus->timedOut) {
+            return $wtStatus;
+        }
+        if ('' !== trim($wtStatus->stdout)) {
+            throw new \RuntimeException('Safe worktree cleanup failed; leaving task unmoved and IDEA project open.'."\n".'Worktree has uncommitted changes.'."\n".'Worktree: '.$worktree."\n".$wtStatus->stdout);
+        }
+
+        $notes = [];
+        $notes[] = JetBrainsMcpClient::closeWorktreeProject($codeRoot, $worktree);
+        try {
+            $cleanup = $this->cleanupWorktreeAndIdeaExclusions($codeRoot, $task, failClosed: true, control: $control);
+            if ($cleanup instanceof ExecResultDTO) {
+                // Cleanup interrupted before/without remove: reopen best-effort.
+                $notes[] = JetBrainsMcpClient::openWorktreeProject($codeRoot, $worktree);
+                $notes[] = 'Reopened JetBrains project after interrupted cancellation cleanup for '.$worktree.'.';
+
+                return $cleanup;
+            }
+            array_push($notes, ...$cleanup);
+
+            return $notes;
+        } catch (\Throwable $e) {
+            // Fail-closed remove leaves the worktree; reopen best-effort so IDE stays usable.
+            $notes[] = JetBrainsMcpClient::openWorktreeProject($codeRoot, $worktree);
+            $notes[] = 'Reopened JetBrains project after failed cancellation cleanup for '.$worktree.'.';
+            throw new \RuntimeException($e->getMessage()."\n".implode("\n", $notes), 0, $e);
+        }
     }
 
     /** @return array{updated: bool, note?: string} */
@@ -447,20 +536,74 @@ final class WorktreeManager
         return rtrim($codeRoot, '/').'/'.ltrim($worktreeBase, '/');
     }
 
-    private function copyTreeIfMissing(string $source, string $dest, ?InvocationControl $control = null): bool
+    /**
+     * @return bool|ExecResultDTO true when copied, false when skipped/nonfatal failure,
+     *                            ExecResultDTO when cancelled/timed out (caller must cleanup)
+     */
+    private function copyTreeIfMissing(string $source, string $dest, ?InvocationControl $control = null): bool|ExecResultDTO
     {
         if (!is_dir($source) || is_dir($dest)) {
             return false;
         }
         try {
-            $this->recursiveCopy($source, $dest, $control);
+            if (!is_dir($dest)) {
+                mkdir($dest, 0o755, true);
+            }
+
+            $result = $this->exec->exec(
+                'cp',
+                ['-a', $source.'/.', $dest.'/'],
+                new ExecOptionsDTO(
+                    timeout: $control?->remainingTimeoutSeconds(),
+                    cancellationToken: $control?->cancellationToken,
+                ),
+            );
+            if ($result->cancelled || $result->timedOut) {
+                return $result;
+            }
+            if (0 !== $result->exitCode) {
+                return false;
+            }
 
             return true;
         } catch (\Throwable) {
-            // Non-fatal: vendor/.vera are developer-convenience copies; the worker can run
-            // composer install or fall back to absolute-path reads. Do not hard-fail here.
+            // Non-fatal: vendor/.vera copies are developer conveniences. A copied
+            // Extension API package is verified and repaired separately below.
             return false;
         }
+    }
+
+    /** @phpstan-impure */
+    private function sourceHasExtensionApiPackage(string $codeRoot): bool
+    {
+        $package = $codeRoot.'/vendor/ineersa/hatfield-extension-api';
+
+        return is_link($package) || is_dir($package);
+    }
+
+    /** @phpstan-impure */
+    private function hasUsableExtensionApiLink(string $worktree): bool
+    {
+        $package = $worktree.'/vendor/ineersa/hatfield-extension-api';
+
+        return is_dir($package) && false !== realpath($package);
+    }
+
+    private function repairRootVendor(string $worktree, ?InvocationControl $control): bool|ExecResultDTO
+    {
+        if (!is_file($worktree.'/composer.json')) {
+            return false;
+        }
+        $result = $this->exec->exec('composer', ['install', '--no-interaction', '--no-progress'], new ExecOptionsDTO(
+            cwd: $worktree,
+            timeout: $control?->remainingTimeoutSeconds(120.0) ?? 120.0,
+            cancellationToken: $control?->cancellationToken,
+        ));
+        if ($result->cancelled || $result->timedOut) {
+            return $result;
+        }
+
+        return 0 === $result->exitCode;
     }
 
     private function installExtensionsVendor(string $worktree, ?InvocationControl $control = null): bool|ExecResultDTO
@@ -488,33 +631,8 @@ final class WorktreeManager
 
             return true;
         } catch (\Throwable) {
-            // Non-fatal: extensions vendor is a developer-convenience; the worker
-            // can run composer install manually or fall back. Do not hard-fail here.
+            // Non-fatal: extensions vendor is a developer convenience.
             return false;
-        }
-    }
-
-    private function recursiveCopy(string $source, string $dest, ?InvocationControl $control = null): void
-    {
-        if (!is_dir($dest)) {
-            mkdir($dest, 0o755, true);
-        }
-        $iterator = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($source, \RecursiveDirectoryIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::SELF_FIRST
-        );
-        foreach ($iterator as $item) {
-            if (null !== $control && $control->isInterrupted()) {
-                throw new \RuntimeException('Copy interrupted.');
-            }
-            $target = $dest.\DIRECTORY_SEPARATOR.$iterator->getSubPathname();
-            if ($item->isDir()) {
-                if (!is_dir($target)) {
-                    mkdir($target, 0o755, true);
-                }
-            } elseif (!copy($item->getPathname(), $target)) {
-                throw new \RuntimeException('Copy failed: '.$item->getPathname());
-            }
         }
     }
 
@@ -534,6 +652,11 @@ final class WorktreeManager
         }
 
         $remove = $this->git->git(['worktree', 'remove', $worktree], $codeRoot);
+        if (0 !== $remove->exitCode) {
+            // This worktree was created by the current failed claim and has no task
+            // metadata yet, so forced removal is confined to owned partial state.
+            $remove = $this->git->git(['worktree', 'remove', '--force', $worktree], $codeRoot);
+        }
         if (0 === $remove->exitCode) {
             $this->removeWorktreeExclusions($slug, $base);
         }

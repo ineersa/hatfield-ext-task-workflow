@@ -38,29 +38,31 @@ final readonly class TaskWorkflowExtension implements HatfieldExtensionInterface
         $taskRoot = $store->resolveTaskRoot();
         $formatter = new TaskListFormatter($store);
 
+        // Package-local skill root: absolute directory containing SKILL.md.
+        $api->registerSkill(\dirname(__DIR__).'/skills/task-workflow');
+
         $api->registerPromptContributor(new WorkflowPrompt($taskRoot));
 
         $statusEnum = ['TODO', 'IN-PROGRESS', 'CODE-REVIEW', 'DONE', 'ARCHIVE', 'CANCELLED'];
 
         $api->registerTool(new ToolRegistrationDTO(
             name: 'task_list',
-            description: 'List workflow tasks from the external task board (TODO, IN-PROGRESS, CODE-REVIEW, DONE, CANCELLED; ARCHIVE only when include_archive is true or status=ARCHIVE).',
+            description: 'List workflow tasks from the external task board (TODO, IN-PROGRESS, CODE-REVIEW, DONE). CANCELLED and ARCHIVE are omitted by default; pass status=CANCELLED to list cancelled tasks, include_archive=true or status=ARCHIVE to list archived tasks.',
             parametersJsonSchema: [
                 'type' => 'object',
                 'properties' => [
-                    'status' => ['type' => 'string', 'enum' => $statusEnum, 'description' => 'Filter by status'],
+                    'status' => ['type' => 'string', 'enum' => $statusEnum, 'description' => 'Filter by status; omit to return all statuses except CANCELLED and ARCHIVE.'],
                     'include_archive' => [
                         'type' => 'boolean',
-                        'description' => 'When true, include ARCHIVE tasks. Default false. With status TODO, returns TODO plus ARCHIVE.',
+                        'description' => 'When true, include ARCHIVE tasks in addition to the selected status; without status, include all statuses. Default false.',
                     ],
                 ],
                 'additionalProperties' => false,
             ],
-            handler: new ListTasksHandler($store, $formatter),
+            handler: new ListTasksHandler($store),
             promptSummary: 'List project workflow tasks from the external task board',
             promptGuidelines: [
                 'Use task_list before starting tracked project work to understand TODO and IN-PROGRESS tasks.',
-                'ARCHIVE is omitted by default; pass include_archive=true or status=ARCHIVE to list archived tasks.',
             ],
         ));
 
@@ -70,10 +72,10 @@ final readonly class TaskWorkflowExtension implements HatfieldExtensionInterface
             parametersJsonSchema: [
                 'type' => 'object',
                 'properties' => [
-                    'title' => ['type' => 'string', 'description' => 'Short task title'],
+                    'title' => ['type' => 'string', 'minLength' => 1, 'description' => 'Short task title'],
                     'body' => ['type' => 'string', 'description' => 'Free-form notes/context for the task'],
-                    'acceptance' => ['type' => 'array', 'items' => ['type' => 'string'], 'description' => 'Acceptance criteria bullets'],
-                    'id' => ['type' => 'string', 'description' => 'Optional filename slug/id. Defaults to date + title slug.'],
+                    'acceptance' => ['type' => 'array', 'items' => ['type' => 'string', 'minLength' => 1], 'description' => 'Acceptance criteria bullets'],
+                    'id' => ['type' => 'string', 'minLength' => 1, 'description' => 'Optional filename slug/id. Defaults to date + title slug.'],
                 ],
                 'required' => ['title'],
                 'additionalProperties' => false,
@@ -91,35 +93,29 @@ final readonly class TaskWorkflowExtension implements HatfieldExtensionInterface
             parametersJsonSchema: [
                 'type' => 'object',
                 'properties' => [
-                    'task' => ['type' => 'string', 'description' => 'Task filename, slug, or unique substring'],
-                    'to' => ['type' => 'string', 'enum' => $statusEnum],
-                    'from' => ['type' => 'string', 'enum' => $statusEnum],
-                    'forkRun' => ['type' => 'string'],
-                    'summary' => ['type' => 'string'],
-                    'validation' => ['type' => 'array', 'items' => ['type' => 'string']],
-                    'worktreeBase' => ['type' => 'string'],
-                    'cleanupWorktree' => ['type' => 'boolean'],
-                    'deleteBranch' => ['type' => 'boolean'],
-                    'requireCleanMain' => ['type' => 'boolean'],
-                    'cleanupStaleIndexEntries' => ['type' => 'boolean'],
-                    'prTitle' => ['type' => 'string'],
-                    'prBody' => ['type' => 'string'],
-                    'prBaseBranch' => ['type' => 'string'],
-                    'pushOnly' => ['type' => 'boolean'],
-                    'castorCheckTimeoutSeconds' => ['type' => 'number', 'minimum' => 60, 'maximum' => 1200],
+                    'task' => ['type' => 'string', 'minLength' => 1, 'description' => 'Task filename, slug, or unique substring'],
+                    'to' => ['type' => 'string', 'enum' => $statusEnum, 'description' => 'Destination status.'],
+                    'from' => ['type' => 'string', 'enum' => $statusEnum, 'description' => 'Optional current status used to narrow task lookup.'],
+                    'forkRun' => ['type' => 'string', 'minLength' => 1, 'description' => 'Implementation fork run ID to store in task metadata.'],
+                    'summary' => ['type' => 'string', 'minLength' => 1, 'description' => 'Completion or handoff summary appended to the task work log.'],
+                    'validation' => ['type' => 'array', 'items' => ['type' => 'string', 'minLength' => 1], 'description' => 'Validation commands or results appended to the task work log.'],
+                    'worktreeBase' => ['type' => 'string', 'minLength' => 1, 'description' => 'Directory for task worktrees. Defaults to ../<repo>-worktrees.'],
+                    'cleanupWorktree' => ['type' => 'boolean', 'description' => 'After a successful DONE merge, remove the worktree. Default true.'],
+                    'deleteBranch' => ['type' => 'boolean', 'description' => 'After a successful DONE merge, delete the task branch. Default false.'],
+                    'requireCleanMain' => ['type' => 'boolean', 'description' => 'Require a clean integration checkout before the DONE merge. Default true.'],
+                    'cleanupStaleIndexEntries' => ['type' => 'boolean', 'description' => 'Before the DONE merge, reset stale staged-add/deleted worktree entries (AD) in the integration checkout. Default false.'],
+                    'prTitle' => ['type' => 'string', 'minLength' => 1, 'description' => 'Title for the GitHub PR when moving to CODE-REVIEW. Defaults to the task title.'],
+                    'prBody' => ['type' => 'string', 'minLength' => 1, 'description' => 'Body for the GitHub PR when moving to CODE-REVIEW.'],
+                    'prBaseBranch' => ['type' => 'string', 'minLength' => 1, 'description' => 'Base branch for the PR. Defaults to the repository default branch.'],
+                    'pushOnly' => ['type' => 'boolean', 'description' => 'Push the branch but skip PR creation. Default false.'],
                 ],
                 'required' => ['task', 'to'],
                 'additionalProperties' => false,
             ],
-            handler: new MoveTaskHandler($store, $git, $worktrees, $pr, $exec, $config, $codeRoot),
+            handler: new MoveTaskHandler($store, $git, $worktrees, $pr, $exec, $codeRoot),
             promptSummary: 'Move tracked project tasks between statuses; creates worktrees, opens PRs, and merges completed task branches',
             promptGuidelines: [
-                'Use move_task instead of manual mv/git worktree commands for tracked task workflow transitions.',
-                'Use move_task with to="IN-PROGRESS" before launching a worker/fork for a tracked task.',
-                'Use move_task with to="CODE-REVIEW" after the worktree branch is committed and ready for review; this automatically runs deterministic castor check in the worktree, then pushes the branch and creates a PR. Run focused Castor validation (castor test, castor deptrac, castor phpstan, castor cs-check) yourself before moving to catch issues early.',
-                'Use move_task with to="DONE" only after PR review is approved and the user/parent decides to merge; move_task reports merge conflicts and leaves the task in CODE-REVIEW on failure.',
-                'Use move_task with to="ARCHIVE" only from DONE; this updates Status metadata and moves the Markdown file with no git side effects.',
-                'Use move_task with to="CANCELLED" to abandon a task from any status; clean worktrees and IDEA exclusions are removed safely, the git branch is left, and dirty worktrees fail closed without moving the task.',
+                'Use move_task rather than manual status-file or worktree moves. Its schema and result describe transition preconditions, side effects, and errors; load the task-workflow skill for orchestration.',
             ],
         ));
 
@@ -129,14 +125,14 @@ final readonly class TaskWorkflowExtension implements HatfieldExtensionInterface
             parametersJsonSchema: [
                 'type' => 'object',
                 'properties' => [
-                    'task' => ['type' => 'string', 'description' => 'Task filename, slug, or unique substring'],
-                    'from' => ['type' => 'string', 'enum' => $statusEnum],
-                    'forkRun' => ['type' => 'string'],
-                    'summary' => ['type' => 'string'],
-                    'validation' => ['type' => 'array', 'items' => ['type' => 'string']],
-                    'prUrl' => ['type' => 'string'],
-                    'prStatus' => ['type' => 'string'],
-                    'workLog' => ['type' => 'array', 'items' => ['type' => 'string']],
+                    'task' => ['type' => 'string', 'minLength' => 1, 'description' => 'Task filename, slug, or unique substring'],
+                    'from' => ['type' => 'string', 'enum' => $statusEnum, 'description' => 'Optional current status used to narrow task lookup.'],
+                    'forkRun' => ['type' => 'string', 'minLength' => 1, 'description' => 'Implementation fork run ID to store in task metadata.'],
+                    'summary' => ['type' => 'string', 'minLength' => 1, 'description' => 'Summary appended to the task work log.'],
+                    'validation' => ['type' => 'array', 'items' => ['type' => 'string', 'minLength' => 1], 'description' => 'Validation commands or results appended to the task work log.'],
+                    'prUrl' => ['type' => 'string', 'minLength' => 1, 'description' => 'PR URL to store in task metadata.'],
+                    'prStatus' => ['type' => 'string', 'enum' => ['open', 'merged', 'closed'], 'description' => 'PR status to store in task metadata.'],
+                    'workLog' => ['type' => 'array', 'items' => ['type' => 'string', 'minLength' => 1], 'description' => 'Custom entries appended to the task work log.'],
                 ],
                 'required' => ['task'],
                 'additionalProperties' => false,
