@@ -18,6 +18,8 @@ use Ineersa\HatfieldExt\TaskWorkflow\Store\TaskMarkdown;
 use Ineersa\HatfieldExt\TaskWorkflow\Store\TaskStatusEnum;
 use Ineersa\HatfieldExt\TaskWorkflow\Worktree\WorktreeManager;
 
+use function Symfony\Component\String\u;
+
 final readonly class MoveTaskHandler implements ContextualExtensionToolHandlerInterface
 {
     private const int CASTOR_CHECK_WALL_SECONDS = 210;
@@ -261,11 +263,10 @@ final readonly class MoveTaskHandler implements ContextualExtensionToolHandlerIn
         // budget exceeds its maximum 270s lifetime, including --kill-after=30s.
         $checkResult = $this->exec->exec(
             'timeout',
-            ['--kill-after=30s', self::CASTOR_CHECK_OUTER_GUARD_SECONDS.'s', 'env', 'LLM_MODE=true', 'castor', 'check'],
+            ['--kill-after=30s', self::CASTOR_CHECK_OUTER_GUARD_SECONDS.'s', 'castor', 'check'],
             new ExecOptionsDTO(
                 cwd: $worktree,
                 timeout: $control->remainingTimeoutSeconds((float) self::CASTOR_CHECK_HOST_TIMEOUT_SECONDS),
-                env: ['LLM_MODE' => 'true'],
                 cancellationToken: $control->cancellationToken,
             ),
         );
@@ -366,7 +367,7 @@ final readonly class MoveTaskHandler implements ContextualExtensionToolHandlerIn
             $message .= "\n".'QA reports: '.$reportDir;
         }
 
-        return $message."\n".'First failure:'."\n".substr($snippet, 0, 1200);
+        return $message."\n".'First failure:'."\n".u($snippet)->truncate(1200)->toString();
     }
 
     /**
