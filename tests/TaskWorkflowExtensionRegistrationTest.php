@@ -47,11 +47,21 @@ final class TaskWorkflowExtensionRegistrationTest extends TestCase
         $installed = $this->projectDir.'/.hatfield/skills/'.TaskWorkflowSkillInstaller::SKILL_NAME.'/SKILL.md';
         $this->assertFileExists($installed);
         $this->assertNotNull(TaskWorkflowMarkdownFrontmatter::versionOf((string) file_get_contents($installed)));
-        $this->assertFileExists($this->projectDir.'/.hatfield/skills/'.TaskWorkflowSkillInstaller::SKILL_NAME.'/references/implementation-ownership.md');
+        $this->assertSame(file_get_contents(\dirname(__DIR__).'/skills/task-workflow/SKILL.md'), file_get_contents($installed));
+        $this->assertDirectoryDoesNotExist(\dirname($installed).'/references');
 
         $this->assertCount(0, $api->skills);
         $this->assertGreaterThanOrEqual(4, \count($api->tools));
+        $this->assertSame([
+            'task_list' => 'task_list [status] [include_archive=false] — list tasks on the project’s external board',
+            'create_task' => 'create_task title [body] [acceptance] [id] — create a TODO task',
+            'move_task' => 'move_task task to [from] — change task status and perform the transition’s Git/worktree/PR actions',
+            'update_task' => 'update_task task [from] [summary] [validation] [workLog] — update task metadata or append work-log entries without changing status',
+        ], array_column($api->tools, 'promptSummary', 'name'));
         $this->assertCount(1, $api->prompts);
+        $prompt = $api->prompts[0]->contribute();
+        $this->assertStringContainsString('Use task tools for board transitions and metadata', $prompt);
+        $this->assertStringContainsString('never commit board metadata to the code repository', $prompt);
         $this->assertGreaterThanOrEqual(5, \count($api->commands));
     }
 
@@ -83,7 +93,9 @@ final class TaskWorkflowExtensionRegistrationTest extends TestCase
             if ('environment' === $source) {
                 $this->assertStringNotContainsString($configured, $prompt);
             }
-            $guidance = (string) file_get_contents($cwd.'/.hatfield/skills/task-workflow/references/board.md');
+            $this->assertStringContainsString('Main alone manages tracked work', $prompt);
+            $this->assertStringContainsString('consolidated `task-workflow` skill', $prompt);
+            $guidance = (string) file_get_contents($cwd.'/.hatfield/skills/task-workflow/SKILL.md');
             $this->assertStringNotContainsString($this->projectDir, $guidance);
             $this->assertStringNotContainsString('/home/ineersa/projects/agent-core', $guidance);
             $this->assertSame($installedGuidance ?? $guidance, $guidance);
@@ -94,7 +106,7 @@ final class TaskWorkflowExtensionRegistrationTest extends TestCase
     #[Test]
     public function changedBoardSettingsRefreshPromptWithoutChangingInstalledGuidance(): void
     {
-        $guidancePath = $this->projectDir.'/.hatfield/skills/task-workflow/references/board.md';
+        $guidancePath = $this->projectDir.'/.hatfield/skills/task-workflow/SKILL.md';
         $guidance = null;
         foreach (['first-board', 'replacement-board'] as $name) {
             $board = $this->projectDir.'/'.$name;
